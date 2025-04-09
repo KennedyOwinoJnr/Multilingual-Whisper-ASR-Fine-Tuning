@@ -10,8 +10,9 @@ Whisper is a powerful pre-trained model for ASR published by OpenAI. This projec
 
 - Fine-tune Whisper models of different sizes (tiny, base, small, medium, large)
 - Support for multiple languages
+- Robust checkpointing system using SQLite to resume interrupted training
+- Automatic checkpointing at each stage of the process
 - Integration with Weights & Biases for experiment tracking
-- Automatic model uploading to Hugging Face Hub
 - Efficient data processing and training
 
 ## Requirements
@@ -118,7 +119,22 @@ The script will prompt for:
    - Get your key from: https://wandb.ai/settings
 
 
-Alternatively you can run the notebook line by line.
+## Checkpointing System
+
+The script includes a robust checkpointing system that allows training to be resumed from where it left off if interrupted. This is especially useful for long-running tasks on large datasets.
+
+### Key Features of the Checkpointing System:
+
+- **SQLite Database**: Uses a SQLite database to track progress, ensuring data integrity even during system crashes
+- **Granular Checkpointing**: Saves progress at multiple stages:
+  - After each language dataset is loaded
+  - After model loading
+  - During feature extraction (at regular intervals)
+  - Throughout training (using HuggingFace's built-in checkpointing)
+- **Automatic Resume**: Automatically detects the last successful state and resumes from there
+- **Resource Efficiency**: Skips already completed steps when restarting
+
+The checkpoints are stored in a SQLite database at `[output_dir]/checkpoints/checkpoints.db`.
 
 ## Resource Requirements
 
@@ -149,3 +165,7 @@ Resource requirements vary based on the model size:
 3. **Authentication errors**:
    - Ensure your Hugging Face token has write permissions
    - Check network connectivity to Hugging Face/Weights & Biases servers
+
+4. **Interrupted training**:
+   - Simply rerun the same command - the checkpointing system will automatically resume from where it left off
+   - If the SQLite database is corrupted (rare), remove the `[output_dir]/checkpoints/checkpoints.db` file and restart

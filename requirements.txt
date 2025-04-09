@@ -1,5 +1,4 @@
-pip
-datasets[audio]
+datasets
 transformers
 accelerate 
 evaluate

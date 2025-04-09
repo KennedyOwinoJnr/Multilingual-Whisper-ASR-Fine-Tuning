@@ -1,6 +1,8 @@
 import os
 import argparse
 import getpass
+import json
+import sqlite3
 from datasets import load_dataset, DatasetDict, Audio, concatenate_datasets
 from transformers import (
     WhisperFeatureExtractor,
@@ -23,6 +25,158 @@ from huggingface_hub import login as hf_login
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Replace checkpoint management functions with SQLite-based versions
+def init_checkpoint_db(db_path):
+    """Initialize the SQLite checkpoint database."""
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    # Create tables if they don't exist
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS process_state (
+        id INTEGER PRIMARY KEY,
+        stage TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        details TEXT
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS language_progress (
+        language TEXT PRIMARY KEY,
+        status TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS feature_extraction (
+        id INTEGER PRIMARY KEY,
+        progress INTEGER,
+        total INTEGER,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    conn.commit()
+    conn.close()
+    logger.info(f"Initialized checkpoint database at {db_path}")
+
+def save_checkpoint(db_path, stage, details=None):
+    """Save checkpoint state to SQLite database."""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    # Convert details dict to JSON string if it exists
+    details_json = json.dumps(details) if details else None
+    
+    # Insert new state
+    cursor.execute(
+        "INSERT INTO process_state (stage, details) VALUES (?, ?)",
+        (stage, details_json)
+    )
+    
+    conn.commit()
+    conn.close()
+    logger.info(f"Checkpoint saved: {stage}")
+
+def get_latest_checkpoint(db_path):
+    """Get the latest checkpoint state from SQLite database."""
+    if not os.path.exists(db_path):
+        return None
+    
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # Get the latest state
+        cursor.execute(
+            "SELECT stage, details FROM process_state ORDER BY id DESC LIMIT 1"
+        )
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            stage, details_json = result
+            details = json.loads(details_json) if details_json else None
+            return {"stage": stage, "details": details}
+        return None
+    except sqlite3.Error as e:
+        logger.error(f"Error reading checkpoint database: {str(e)}")
+        return None
+
+def save_language_progress(db_path, language, status):
+    """Save language dataset loading progress."""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    # Insert or replace language status
+    cursor.execute(
+        "INSERT OR REPLACE INTO language_progress (language, status) VALUES (?, ?)",
+        (language, status)
+    )
+    
+    conn.commit()
+    conn.close()
+
+def get_completed_languages(db_path):
+    """Get list of languages that have been successfully loaded."""
+    if not os.path.exists(db_path):
+        return []
+    
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "SELECT language FROM language_progress WHERE status = 'completed'"
+        )
+        results = cursor.fetchall()
+        conn.close()
+        
+        return [lang[0] for lang in results]
+    except sqlite3.Error as e:
+        logger.error(f"Error reading language progress: {str(e)}")
+        return []
+
+def save_feature_extraction_progress(db_path, progress, total):
+    """Save feature extraction progress."""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    # Insert new progress record
+    cursor.execute(
+        "INSERT INTO feature_extraction (progress, total) VALUES (?, ?)",
+        (progress, total)
+    )
+    
+    conn.commit()
+    conn.close()
+
+def get_latest_feature_extraction_progress(db_path):
+    """Get the latest feature extraction progress."""
+    if not os.path.exists(db_path):
+        return None
+    
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "SELECT progress, total FROM feature_extraction ORDER BY id DESC LIMIT 1"
+        )
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            progress, total = result
+            return {"progress": progress, "total": total}
+        return None
+    except sqlite3.Error as e:
+        logger.error(f"Error reading feature extraction progress: {str(e)}")
+        return None
+
 def login_to_platforms():
     """Prompt for and set up authentication tokens for HF and W&B."""
     # Hugging Face login
@@ -43,53 +197,111 @@ def login_to_platforms():
         else:
             logger.warning("No W&B token provided. Training metrics will not be logged to W&B.")
 
-def load_and_prepare_datasets(languages=None, cache_dir=None):
-    """Load and prepare datasets more efficiently.
+def load_and_prepare_datasets(languages=None, cache_dir=None, checkpoint_dir=None):
+    """Load and prepare datasets more efficiently with SQLite-based checkpointing.
     
     Args:
         languages: List of language codes to load
         cache_dir: Directory to cache the datasets
+        checkpoint_dir: Directory to store checkpoints
     """
     if languages is None:
         languages = ["sw", "en"]  # Default to Swahili and English
     
+    db_path = None
+    if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        db_path = os.path.join(checkpoint_dir, "checkpoints.db")
+        init_checkpoint_db(db_path)
+        
+        # Check if we've already loaded the datasets
+        checkpoint = get_latest_checkpoint(db_path)
+        if checkpoint and checkpoint['stage'] == 'datasets_loaded':
+            logger.info(f"Resuming from previous dataset loading checkpoint")
+            if checkpoint['details'] and 'dataset_path' in checkpoint['details']:
+                return checkpoint['details']['dataset_path']
+    
     logger.info(f"Loading datasets for languages: {languages}")
     
-    datasets = {}
-    for lang in languages:
-        logger.info(f"Loading {lang} dataset...")
-        # Load both train+validation and test in one call to avoid redundant downloads
-        ds = load_dataset(
-            "mozilla-foundation/common_voice_11_0", 
-            lang, 
-            split=["train+validation", "test"],
-            cache_dir=cache_dir
-        )
-        datasets[lang] = {"train": ds[0], "test": ds[1]}
+    try:
+        datasets = {}
+        completed_languages = get_completed_languages(db_path) if db_path else []
+        
+        for i, lang in enumerate(languages):
+            # Skip languages that have already been loaded
+            if lang in completed_languages:
+                logger.info(f"Skipping {lang} dataset (already loaded)")
+                continue
+                
+            logger.info(f"Loading {lang} dataset ({i+1}/{len(languages)})...")
+            # Load both train+validation and test in one call to avoid redundant downloads
+            ds = load_dataset(
+                "mozilla-foundation/common_voice_11_0", 
+                lang, 
+                split=["train+validation", "test"],
+                cache_dir=cache_dir
+            )
+            datasets[lang] = {"train": ds[0], "test": ds[1]}
+            
+            # Save intermediate checkpoint after each language dataset is loaded
+            if db_path:
+                save_language_progress(db_path, lang, "completed")
+        
+        # Get any previously completed languages that weren't in the current run
+        for lang in completed_languages:
+            if lang not in datasets and lang in languages:
+                logger.info(f"Loading previously completed {lang} dataset...")
+                ds = load_dataset(
+                    "mozilla-foundation/common_voice_11_0", 
+                    lang, 
+                    split=["train+validation", "test"],
+                    cache_dir=cache_dir
+                )
+                datasets[lang] = {"train": ds[0], "test": ds[1]}
+        
+        # Combine training datasets
+        logger.info("Combining datasets...")
+        train_datasets = [ds["train"] for ds in datasets.values()]
+        test_datasets = [ds["test"] for ds in datasets.values()]
+        
+        combined_train = concatenate_datasets(train_datasets).shuffle(seed=42)
+        combined_test = concatenate_datasets(test_datasets).shuffle(seed=42)
+        
+        common_voice = DatasetDict({
+            "train": combined_train,
+            "test": combined_test
+        })
+        
+        # Remove unwanted columns
+        logger.info("Removing unwanted columns...")
+        columns_to_remove = [
+            "accent", "age", "client_id", "down_votes", 
+            "gender", "locale", "path", "segment", "up_votes"
+        ]
+        common_voice = common_voice.remove_columns(columns_to_remove)
+        
+        # Prepare audio data
+        logger.info("Preparing audio data...")
+        common_voice = common_voice.cast_column("audio", Audio(sampling_rate=16000))
+        
+        # Save dataset checkpoint
+        if checkpoint_dir:
+            # Save the dataset to disk to resume later
+            dataset_path = os.path.join(checkpoint_dir, "processed_dataset")
+            common_voice.save_to_disk(dataset_path)
+            save_checkpoint(db_path, "datasets_loaded", {"dataset_path": dataset_path})
+        
+        return common_voice
     
-    # Combine training datasets
-    train_datasets = [ds["train"] for ds in datasets.values()]
-    test_datasets = [ds["test"] for ds in datasets.values()]
-    
-    combined_train = concatenate_datasets(train_datasets).shuffle(seed=42)
-    combined_test = concatenate_datasets(test_datasets).shuffle(seed=42)
-    
-    common_voice = DatasetDict({
-        "train": combined_train,
-        "test": combined_test
-    })
-    
-    # Remove unwanted columns
-    columns_to_remove = [
-        "accent", "age", "client_id", "down_votes", 
-        "gender", "locale", "path", "segment", "up_votes"
-    ]
-    common_voice = common_voice.remove_columns(columns_to_remove)
-    
-    # Prepare audio data
-    common_voice = common_voice.cast_column("audio", Audio(sampling_rate=16000))
-    
-    return common_voice
+    except Exception as e:
+        logger.error(f"Error during dataset loading: {str(e)}")
+        if db_path:
+            logger.info("Saving error checkpoint before exiting...")
+            save_checkpoint(db_path, "error", {
+                "error": str(e),
+                "last_state": "dataset_loading"
+            })
+        raise
 
 def load_model_and_processors(model_name="openai/whisper-large", languages=None, device_map="auto"):
     """Load model and processors more efficiently.
@@ -122,8 +334,17 @@ def load_model_and_processors(model_name="openai/whisper-large", languages=None,
     
     return model, feature_extractor, tokenizer, processor
 
-def prepare_dataset_features(batch, feature_extractor, tokenizer):
-    """Process a single batch to prepare features and labels."""
+def prepare_dataset_features(batch, feature_extractor, tokenizer, counter=None, total=None, db_path=None):
+    """Process a single batch to prepare features and labels with progress tracking using SQLite."""
+    if counter is not None and counter.value % 100 == 0 and total is not None:
+        progress = counter.value
+        progress_percentage = (progress / total) * 100
+        logger.info(f"Processing features: {progress}/{total} ({progress_percentage:.2f}%)")
+        
+        # Save checkpoint periodically during feature extraction
+        if db_path:
+            save_feature_extraction_progress(db_path, progress, total)
+    
     audio = batch["audio"]
     
     # Compute input features from audio array
@@ -134,6 +355,10 @@ def prepare_dataset_features(batch, feature_extractor, tokenizer):
     
     # Encode target text to label ids
     batch["labels"] = tokenizer(batch["sentence"]).input_ids
+    
+    if counter is not None:
+        counter.value += 1
+        
     return batch
 
 @dataclass
@@ -185,33 +410,111 @@ def get_compute_metrics_fn(tokenizer, metric_name="wer"):
     return compute_metrics
 
 def main(args):
-    # Login to platforms if needed
-    login_to_platforms()
+    # Set up checkpoint directory and database
+    checkpoint_dir = os.path.join(args.output_dir, "checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    db_path = os.path.join(checkpoint_dir, "checkpoints.db")
+    init_checkpoint_db(db_path)
+    
+    # Check for existing process checkpoint
+    checkpoint = get_latest_checkpoint(db_path)
+    current_stage = checkpoint.get('stage') if checkpoint else None
+    
+    # Login to platforms if needed and checkpoint doesn't exist
+    if current_stage is None:
+        login_to_platforms()
+        save_checkpoint(db_path, "login_completed")
     
     # Load and prepare datasets
-    logger.info("Loading and preparing datasets...")
-    common_voice = load_and_prepare_datasets(
-        languages=args.languages,
-        cache_dir=args.cache_dir
-    )
+    common_voice = None
+    dataset_path = None
     
-    # Load model and processors
-    logger.info(f"Loading model {args.model_name}...")
-    model, feature_extractor, tokenizer, processor = load_model_and_processors(
-        model_name=args.model_name,
-        languages=[lang.capitalize() for lang in args.languages],
-        device_map=args.device_map
-    )
+    if current_stage is None or current_stage in ['login_completed', 'error']:
+        logger.info("Loading and preparing datasets...")
+        try:
+            result = load_and_prepare_datasets(
+                languages=args.languages,
+                cache_dir=args.cache_dir,
+                checkpoint_dir=checkpoint_dir
+            )
+            
+            # Check if the result is a dataset or a path to a saved dataset
+            if isinstance(result, str) and os.path.exists(result):
+                dataset_path = result
+                save_checkpoint(db_path, "datasets_loaded", {"dataset_path": dataset_path})
+            else:
+                common_voice = result
+                save_checkpoint(db_path, "datasets_loaded")
+        except Exception as e:
+            logger.error(f"Error during dataset loading: {str(e)}")
+            save_checkpoint(db_path, "error", {
+                "error": str(e),
+                "last_state": "dataset_loading"
+            })
+            raise
     
-    # Prepare datasets with features
-    logger.info("Preparing datasets with features...")
-    prepare_fn = lambda batch: prepare_dataset_features(batch, feature_extractor, tokenizer)
-    common_voice = common_voice.map(
-        prepare_fn,
-        remove_columns=common_voice.column_names["train"],
-        num_proc=args.num_proc,
-        desc="Processing audio and generating features"
-    )
+    # Load dataset from disk if path is provided
+    if dataset_path and common_voice is None:
+        logger.info(f"Loading processed dataset from {dataset_path}...")
+        common_voice = DatasetDict.load_from_disk(dataset_path)
+    
+    # Load model and processors if not already done
+    model, feature_extractor, tokenizer, processor = None, None, None, None
+    if current_stage is None or current_stage in ['login_completed', 'datasets_loaded', 'error']:
+        logger.info(f"Loading model {args.model_name}...")
+        try:
+            model, feature_extractor, tokenizer, processor = load_model_and_processors(
+                model_name=args.model_name,
+                languages=[lang.capitalize() for lang in args.languages],
+                device_map=args.device_map
+            )
+            save_checkpoint(db_path, "model_loaded")
+        except Exception as e:
+            logger.error(f"Error loading model: {str(e)}")
+            save_checkpoint(db_path, "error", {
+                "error": str(e),
+                "last_state": "model_loading"
+            })
+            raise
+    
+    # Process features if not already done
+    processed_dataset_path = os.path.join(checkpoint_dir, "processed_features_dataset")
+    
+    if os.path.exists(processed_dataset_path):
+        logger.info(f"Loading processed features dataset from {processed_dataset_path}...")
+        common_voice = DatasetDict.load_from_disk(processed_dataset_path)
+    elif current_stage is None or current_stage in ['datasets_loaded', 'model_loaded', 'error']:
+        logger.info("Preparing datasets with features...")
+        try:
+            # Create a shared counter for progress tracking
+            from multiprocessing import Value
+            counter = Value('i', 0)
+            total = len(common_voice["train"]) + len(common_voice["test"])
+            
+            # Create a dataset processing function with progress tracking
+            prepare_fn = lambda batch: prepare_dataset_features(
+                batch, feature_extractor, tokenizer, counter, total, db_path
+            )
+            
+            # Process the dataset
+            common_voice = common_voice.map(
+                prepare_fn,
+                remove_columns=common_voice.column_names["train"],
+                num_proc=args.num_proc,
+                desc="Processing audio and generating features"
+            )
+            
+            # Save processed dataset
+            logger.info(f"Saving processed features dataset to {processed_dataset_path}...")
+            common_voice.save_to_disk(processed_dataset_path)
+            save_checkpoint(db_path, "features_processed")
+        except Exception as e:
+            logger.error(f"Error processing features: {str(e)}")
+            save_checkpoint(db_path, "error", {
+                "error": str(e),
+                "last_state": "feature_processing"
+            })
+            raise
     
     # Create data collator
     data_collator = DataCollatorSpeechSeq2SeqWithPadding(
@@ -260,12 +563,19 @@ def main(args):
     )
     
     # Save processor for later use
-    logger.info(f"Saving processor to {args.output_dir}")
-    processor.save_pretrained(args.output_dir)
+    processor_path = os.path.join(args.output_dir, "processor")
+    if not os.path.exists(processor_path):
+        logger.info(f"Saving processor to {processor_path}")
+        processor.save_pretrained(processor_path)
     
     # Train the model
     logger.info("Starting training...")
-    trainer.train()
+    save_checkpoint(db_path, "training_started")
+    
+    # Training will automatically resume from the last checkpoint if it exists
+    trainer.train(resume_from_checkpoint=checkpoint is not None)
+    
+    save_checkpoint(db_path, "training_completed")
     
     # Push model to the hub if requested
     if args.push_to_hub:
@@ -281,6 +591,7 @@ def main(args):
             "tasks": "automatic-speech-recognition",
         }
         trainer.push_to_hub(**kwargs)
+        save_checkpoint(db_path, "pushed_to_hub")
     
     logger.info("Training completed!")
 
