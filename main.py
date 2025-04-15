@@ -82,7 +82,7 @@ def load_and_prepare_datasets(languages=None, cache_dir=None):
     # Remove unwanted columns
     columns_to_remove = [
         "accent", "age", "client_id", "down_votes", 
-        "gender", "locale", "path", "segment", "up_votes"
+        "gender", "path", "segment", "up_votes"
     ]
     common_voice = common_voice.remove_columns(columns_to_remove)
     
@@ -106,8 +106,8 @@ def load_model_and_processors(model_name="openai/whisper-large", languages=None,
     
     # Load components with a single API call when possible
     feature_extractor = WhisperFeatureExtractor.from_pretrained(model_name)
-    tokenizer = WhisperTokenizer.from_pretrained(model_name, language=languages, task="transcribe")
-    processor = WhisperProcessor.from_pretrained(model_name, language=languages, task="transcribe")
+    tokenizer = WhisperTokenizer.from_pretrained(model_name)
+    processor = WhisperProcessor.from_pretrained(model_name)
     
     logger.info(f"Loading model from {model_name}")
     model = WhisperForConditionalGeneration.from_pretrained(
@@ -131,9 +131,23 @@ def prepare_dataset_features(batch, feature_extractor, tokenizer):
         audio["array"], 
         sampling_rate=audio["sampling_rate"]
     ).input_features[0]
+
+    #get lan codes from locale column
+    lan_code = batch['locale']
+    lang_mapping = {
+        'sw': 'Swahili',
+        'en': 'English'
+    }
+
+    language  = lang_mapping.get(lan_code, 'English') # we default to English if not found
     
-    # Encode target text to label ids
-    batch["labels"] = tokenizer(batch["sentence"]).input_ids
+    # Tokenize text with language and task
+    batch["labels"] = tokenizer(
+        batch["sentence"], 
+        language=language, 
+        task="transcribe"
+    ).input_ids
+
     return batch
 
 @dataclass
