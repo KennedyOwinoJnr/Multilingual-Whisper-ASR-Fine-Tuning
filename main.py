@@ -91,6 +91,24 @@ def load_and_prepare_datasets(languages=None, cache_dir=None):
     
     return common_voice
 
+
+def debug_tokenizer(tokenizer):
+    """Print information about the tokenizer to help with debugging."""
+    # Check for special tokens
+    print("Special tokens:")
+    print(tokenizer.special_tokens_map)
+    
+    # Check if language tokens exist
+    for lang in ["en", "sw", "<|en|>", "<|sw|>", "<|English|>", "<|Swahili|>"]:
+        token_id = tokenizer.convert_tokens_to_ids(lang)
+        print(f"Token ID for '{lang}': {token_id}")
+    
+    # Check if task tokens exist
+    for task in ["transcribe", "<|transcribe|>"]:
+        token_id = tokenizer.convert_tokens_to_ids(task)
+        print(f"Token ID for '{task}': {token_id}")
+
+
 def load_model_and_processors(model_name="openai/whisper-large", languages=None, device_map="auto"):
     """Load model and processors more efficiently.
     
@@ -108,6 +126,8 @@ def load_model_and_processors(model_name="openai/whisper-large", languages=None,
     feature_extractor = WhisperFeatureExtractor.from_pretrained(model_name)
     tokenizer = WhisperTokenizer.from_pretrained(model_name)
     processor = WhisperProcessor.from_pretrained(model_name)
+
+    debug_tokenizer(tokenizer)  # Debugging tokenizer
     
     logger.info(f"Loading model from {model_name}")
     model = WhisperForConditionalGeneration.from_pretrained(
@@ -122,6 +142,7 @@ def load_model_and_processors(model_name="openai/whisper-large", languages=None,
     
     return model, feature_extractor, tokenizer, processor
 
+
 def prepare_dataset_features(batch, feature_extractor, tokenizer):
     """Process a single batch to prepare features and labels."""
     audio = batch["audio"]
@@ -132,23 +153,34 @@ def prepare_dataset_features(batch, feature_extractor, tokenizer):
         sampling_rate=audio["sampling_rate"]
     ).input_features[0]
 
-    #get lan codes from locale column
+    # Get language codes from locale column
     lan_code = batch['locale']
     lang_mapping = {
-        'sw': 'Swahili',
-        'en': 'English'
+        'sw': 'sw',  
+        'en': 'en'   
     }
 
-    language  = lang_mapping.get(lan_code, 'English') # we default to English if not found
+    language = lang_mapping.get(lan_code, 'en')  # Default to English if not found
     
-    # Tokenize text with language and task
-    batch["labels"] = tokenizer(
-        batch["sentence"], 
-        language=language, 
-        task="transcribe"
-    ).input_ids
-
+    # 1. First add the special tokens for language and task
+    transcribe_token = tokenizer.convert_tokens_to_ids("<|transcribe|>")
+    language_token = tokenizer.convert_tokens_to_ids(f"<|{language}|>")
+    
+    # 2. Tokenize the text without special tokens
+    text_tokens = tokenizer(batch["sentence"], add_special_tokens=False).input_ids
+    
+    # 3. Manually create the full sequence with proper tokens
+    # Format: <|startoftranscript|> <|language|> <|transcribe|> text <|endoftext|>
+    start_token = tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
+    end_token = tokenizer.eos_token_id
+    
+    # Combine all tokens in proper order
+    full_sequence = [start_token, language_token, transcribe_token] + text_tokens + [end_token]
+    
+    batch["labels"] = full_sequence
+    
     return batch
+
 
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
